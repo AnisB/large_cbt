@@ -1,0 +1,102 @@
+#define WORKRGROUP_SIZE 64
+
+// Includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define GEOMETRY_CB_BINDING_SLOT CBV_SLOT(1)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(2)
+#define UPDATE_CB_BINDING_SLOT CBV_SLOT(3)
+
+// SRVs
+#define BASE_VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define HEAP_ID_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define INDEXED_BISECTOR_BUFFER_BINDING_SLOT SRV_SLOT(2)
+#define INDIRECT_DRAW_BUFFER_BINDING_SLOT SRV_SLOT(3)
+#define LEB_MATRIX_CACHE_BINDING_SLOT SRV_SLOT(4)
+
+// UAVs
+#define CURRENT_VERTEX_BUFFER_SLOT UAV_SLOT(0)
+
+// Counters
+#define NUM_SRV_BINDING_SLOTS 2
+#define NUM_CBV_BINDING_SLOTS 3
+#define NUM_UAV_BINDING_SLOTS 17
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/bisector.hlsl"
+#if !defined(FP64_UNSUPPORTED)
+#define LEB_DOUBLE
+#endif
+#include "shader_lib/mesh_utilities.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _BaseVertexBuffer: register(BASE_VERTEX_BUFFER_BINDING_SLOT);                          // SRV
+StructuredBuffer<uint64_t> _HeapIDBuffer: register(HEAP_ID_BUFFER_BINDING_SLOT);                                // SRV
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);                  // SRV
+StructuredBuffer<uint> _IndirectDrawBuffer: register(INDIRECT_DRAW_BUFFER_BINDING_SLOT);                        // SRV
+
+// UAVs
+RWStructuredBuffer<REAL3_DP> _LEBPositionBuffer: register(CURRENT_VERTEX_BUFFER_SLOT);
+
+[numthreads(WORKRGROUP_SIZE, 1, 1)]
+void ClearBuffer(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _TotalNumVertices)
+        return;
+    _LEBPositionBuffer[currentID] = REAL3_DP(0.0, 0.0, 0.0);
+}
+
+LEB_DATA_TYPE3 TransformToPlanetCoordinate(LEB_DATA_TYPE3 posPS)
+{
+    // Evaluate the planet position
+    #if !defined(FP64_UNSUPPORTED)
+        double invL = invsqrt_double(posPS.x * posPS.x + posPS.y * posPS.y + posPS.z * posPS.z);
+        return _PlanetCenter + posPS * invL * _PlanetRadius;
+    #else
+        return _PlanetCenter + normalize(posPS) * _PlanetRadius;
+    #endif
+}
+
+[numthreads(WORKRGROUP_SIZE, 1, 1)]
+void EvaluateLEB(uint currentID : SV_DispatchThreadID, uint groupIndex: SV_GroupIndex)
+{
+    #if defined(LEB_MATRIX_CACHE_BINDING_SLOT)
+    // Make sure these are loaded to the shared memory
+    load_leb_matrix_cache_to_shared_memory(groupIndex);
+    #endif
+
+    // This thread doesn't have any work to do, we're done
+    uint32_t numBisectors = pre_rendering_frame() ? (_IndirectDrawBuffer[9]) : (_IndirectDrawBuffer[8] / 4);
+    if (currentID >= numBisectors)
+        return;
+
+    // Load the bisector for this element
+    currentID = _IndexedBisectorBuffer[currentID];
+
+    // Evaluate the depth of the element
+    uint64_t cHeapID = _HeapIDBuffer[currentID];
+    uint depth = HeapIDDepth(cHeapID);
+
+    // Evaluate the positions of the current element
+    Triangle parentTri, childTri;
+    EvaluateElementPosition(cHeapID, 0, _BaseDepth, _BaseVertexBuffer, parentTri, childTri);
+
+    // Export the child
+    _LEBPositionBuffer[3 * currentID] = TransformToPlanetCoordinate(childTri.p[0]);
+    _LEBPositionBuffer[3 * currentID + 1] = TransformToPlanetCoordinate(childTri.p[1]);
+    _LEBPositionBuffer[3 * currentID + 2] = TransformToPlanetCoordinate(childTri.p[2]);
+
+    // Export the fourth element
+    if (_BaseDepth < depth)
+    {
+        // Offset for the parent buffer
+        const uint parentOffset = 3 * _TotalNumElements;
+
+        // Transform the coordinate to planet space
+        _LEBPositionBuffer[parentOffset + currentID] = TransformToPlanetCoordinate(cHeapID % 2 == 0 ? parentTri.p[0] : parentTri.p[2]);
+    }
+}

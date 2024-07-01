@@ -1,0 +1,63 @@
+// Initial includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define RENDER_CUBEMAP_CBV_COUNT 1
+
+// SRVs
+#define CUBEMAP_TEXTURE_BINDING_SLOT SRV_SLOT(0)
+#define RENDER_CUBEMAP_SRV_COUNT 1
+
+// Samplers
+#define CUBEMAP_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+#define RENDER_CUBEMAP_SAMPLER_COUNT 1
+
+// Includes
+#include "shader_lib/constant_buffers.hlsl"
+
+// SRVs
+Texture2D<float4> _SpaceTexture: register(CUBEMAP_TEXTURE_BINDING_SLOT);
+
+// Samplers
+SamplerState sampler_linear_clamp : register(CUBEMAP_SAMPLER_BINDING_SLOT);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    VertexOutput output;
+    float2 uv = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+    output.positionCS = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return output;
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+float4 frag(PixelInput input) : SV_Target0
+{
+    // Build the a world direction
+    float3 depthBufferPosition = evaluate_world_space_position(input.positionCS.xy * _ScreenSize.zw, 0.5, _InvViewProjectionMatrix);
+
+    // Compute the world direction and world position
+    float3 rayDir = normalize(depthBufferPosition);
+    float2 uv = normalized_coordinates_to_longlat(rayDir);
+
+    // Evaluate the lighting
+    float3 skyColor = _SpaceTexture.Sample(sampler_linear_clamp, uv).xyz;
+
+    // Apply a fast srgb
+    return float4(pow(skyColor, 1.6), 1.0);
+}

@@ -1,0 +1,86 @@
+// Initial includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define GEOMETRY_CB_BINDING_SLOT CBV_SLOT(1)
+
+// SRVs
+#define CURRENT_VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define INDEXED_BISECTOR_BUFFER_BINDING_SLOT SRV_SLOT(1)
+
+// Includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/visibility_buffer.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _CurrentVertexBuffer: register(CURRENT_VERTEX_BUFFER_BINDING_SLOT);
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);
+
+// Vertex input
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+// Vertex output
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+    uint triangleID : TRIANGLE_ID;
+    #if defined(UNSUPPORTED_BARYCENTRICS)
+    float3 barycentrics : BARYCENTRICS;
+    #endif
+};
+
+VertexOutput vert(VertexInput input)
+{
+    // Initialize the output structure
+    VertexOutput output;
+    output = (VertexOutput)0;
+
+    // Evaluate the properties of this triangle
+    uint triangle_id = input.vertexID / 3;
+    uint local_vert_id = input.vertexID % 3;
+
+    // Operate the indirection
+    output.triangleID = _IndexedBisectorBuffer[triangle_id];
+
+    // Which vertex should be read?
+    local_vert_id = local_vert_id == 0 ? 2 : (local_vert_id == 2 ? 0 : 1);
+    float3 positionRWS = _CurrentVertexBuffer[output.triangleID * 3 + local_vert_id];
+
+    // Apply the view projection
+    output.positionCS = mul(_ViewProjectionMatrix, float4(positionRWS, 1.0));
+    #if defined(UNSUPPORTED_BARYCENTRICS)
+    output.barycentrics = local_vert_id == 0 ? float3(1, 0, 0) : (local_vert_id == 2 ? float3(0, 0, 1) : float3(0, 1, 0));
+    #endif
+    return output;
+}
+
+// Pixel input
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+    uint triangleID : TRIANGLE_ID;
+    #if !defined(UNSUPPORTED_BARYCENTRICS)
+    float3 barycentrics : SV_Barycentrics;
+    #else
+    float3 barycentrics : BARYCENTRICS;
+    #endif
+};
+
+// Pixel output
+struct PixelOutput
+{
+    uint4 attachment0 : SV_Target0;
+};
+
+PixelOutput frag(PixelInput input)
+{
+    // Output the lighting
+    PixelOutput output;
+    output.attachment0 = pack_visibility_buffer(input.barycentrics.xy, _MaterialID, input.triangleID);
+    return output;
+}

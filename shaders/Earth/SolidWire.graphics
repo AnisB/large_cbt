@@ -1,0 +1,150 @@
+// Includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(2)
+#define DEFORMATION_CB_BINDING_SLOT CBV_SLOT(3)
+#define UPDATE_CB_BINDING_SLOT CBV_SLOT(4)
+
+// SRVs
+#define CURRENT_VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define INDEXED_BISECTOR_BUFFER_BINDING_SLOT SRV_SLOT(2)
+#define TRANSMITTANCE_LUT_TEXTURE_BINDING_SLOT SRV_SLOT(3)
+#define MULTI_SCATTERING_LUT_TEXTURE_BINDING_SLOT SRV_SLOT(4)
+#define SURFACE_GRADIENT_BUFFER_BINDING_SLOT SRV_SLOT(5)
+
+// Samplers
+#define SURFACE_GRADIENT_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+#define SKY_SAMPLER_BINDING_SLOT SPL_SLOT(1)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#define ENABLE_WRAP_LIGHTING
+#include "shader_lib/disney.hlsl"
+#include "shader_lib/lighting_evaluation.hlsl"
+#include "shader_lib/sg_utilities.hlsl"
+#include "shader_lib/sky_utilities.hlsl"
+#include "shader_lib/visibility_buffer.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _CurrentVertexBuffer: register(CURRENT_VERTEX_BUFFER_BINDING_SLOT);
+StructuredBuffer<float3> _CurrentDisplacementBuffer: register(CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT);
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_BINDING_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_BINDING_SLOT);
+
+// Samplers
+SamplerState sky_sampler_linear_clamp : register(SKY_SAMPLER_BINDING_SLOT);
+
+// Last includes
+#include "shader_lib/earth_utilities.hlsl"
+
+// Input for the vertex shader
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+// Output of the vertex shaders
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    // Initialize the output structure
+    VertexOutput output;
+    output = (VertexOutput)0;
+
+    // Evaluate the properties of this triangle
+    uint triangle_id = input.vertexID / 3;
+    uint local_vert_id = input.vertexID % 3;
+
+    // Operate the indirection
+    triangle_id = _IndexedBisectorBuffer[triangle_id];
+
+    // Which vertex should be read?
+    local_vert_id = local_vert_id == 0 ? 2 : (local_vert_id == 2 ? 0 : 1);
+
+    // Camera relative world space position
+    REAL3_DP positionRWS = REAL3_DP(_CurrentVertexBuffer[triangle_id * 3 + local_vert_id]) + _UpdateCameraPosition - _CameraPosition;
+
+    // Original position
+    output.positionORWS = float3(positionRWS - _CurrentDisplacementBuffer[triangle_id * 3 + local_vert_id]);
+
+    // Apply the view projection
+    output.positionCS = float4(mul(_ViewProjectionMatrix, float4(positionRWS, 1.0)));
+    output.positionRWS = float3(positionRWS);
+    return output;
+}
+
+// Input of the geometry shader
+struct GeometryInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+};
+
+// Output of the geometry shader
+struct GeometryOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+    float3 dist : DISTANCE;
+};
+
+[maxvertexcount(3)]
+void geom(triangle GeometryInput input[3], inout TriangleStream<GeometryOutput> outStream)
+{   
+    // Compute the vectors and the area
+    float2 p0 = clip_space_to_pixel(input[0].positionCS, _ScreenSize.xy);
+    float2 p1 = clip_space_to_pixel(input[1].positionCS, _ScreenSize.xy);
+    float2 p2 = clip_space_to_pixel(input[2].positionCS, _ScreenSize.xy);
+    float2 v[3] = {p2 - p1, p2 - p0, p1 - p0};
+    float area = abs(v[1].x * v[2].y - v[1].y * v[2].x);
+
+    // Emit the vertices
+    GeometryOutput output = (GeometryOutput)0;
+    for (uint vertID = 0; vertID < 3; ++vertID)
+    {
+        output.positionCS = input[vertID].positionCS;
+        output.positionRWS = input[vertID].positionRWS;
+        output.positionORWS = input[vertID].positionORWS;
+        output.dist = 0.0;
+        output.dist[vertID] = area * rsqrt(dot(v[vertID],v[vertID]));
+        outStream.Append(output);
+    }
+    outStream.RestartStrip();
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+    float3 dist : DISTANCE;
+};
+
+float4 frag(PixelInput input) : SV_Target0
+{
+    // Evaluate the original planet space position
+    REAL3_DP positionOPS = REAL3_DP(input.positionORWS) + _CameraPosition - _PlanetCenter;
+
+    // Evaluate the direct lighting
+    float3 lighting = evaluate_earth_lighting(positionOPS, input.positionRWS, _Attenuation);
+   
+    // Evaluate the wireframe
+    lighting = apply_wireframe(lighting, _WireFrameColor, _WireFrameSize, input.dist);
+
+    // Output the lighting
+    return float4(lighting, 1.0);
+}

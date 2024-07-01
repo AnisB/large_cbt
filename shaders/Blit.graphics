@@ -1,0 +1,41 @@
+// SRVs
+Texture2D<float4> _InputTexture : register(t0);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    VertexOutput output;
+    float2 uv = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+    output.positionCS = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return output;
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+float4 frag_rgba(PixelInput input) : SV_Target0
+{
+    return _InputTexture.Load(float3(input.positionCS.xy, 0.0));
+}
+
+float frag_r32(PixelInput input) : SV_Target0
+{
+    return _InputTexture.Load(float3(input.positionCS.xy, 0.0)).x;
+}
+
+float2 frag_rg32(PixelInput input) : SV_Target0
+{
+    return _InputTexture.Load(float3(input.positionCS.xy, 0.0)).xy;
+}

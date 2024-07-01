@@ -1,0 +1,205 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// Includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define WATER_SIMULATION_CB_SLOT CBV_SLOT(0)
+#define WATER_SIMULATION_CBV_COUNT 1
+
+// SRVs
+#define SPECTRUM_BUFFER_SLOT SRV_SLOT(0)
+#define DISPLACEMENT_BUFFER_SLOT SRV_SLOT(1)
+#define WATER_SIMULATION_SRV_COUNT 2
+
+// UAVs
+#define SPECTRUM_RW_BUFFER_SLOT UAV_SLOT(0)
+#define HT_REAL_RW_BUFFER_SLOT UAV_SLOT(1)
+#define HT_IMAGINARY_RW_BUFFER_SLOT UAV_SLOT(2)
+#define SURFACE_GRADIENT_MIP0_SLOT UAV_SLOT(3)
+#define SURFACE_GRADIENT_MIP1_SLOT UAV_SLOT(4)
+#define SURFACE_GRADIENT_MIP2_SLOT UAV_SLOT(5)
+#define SURFACE_GRADIENT_MIP3_SLOT UAV_SLOT(6)
+#define SURFACE_GRADIENT_MIP4_SLOT UAV_SLOT(7)
+#define WATER_SIMULATION_UAV_COUNT 8
+
+// Includes
+#include "shader_lib/water_utilities.hlsl"
+
+// SRVs
+Texture2DArray<float2> _SpectrumBuffer : register(SPECTRUM_BUFFER_SLOT);
+Texture2DArray<float4> _DisplacementBuffer : register(DISPLACEMENT_BUFFER_SLOT);
+
+// UAVs
+RWTexture2DArray<float2> _SpectrumBufferRW : register(SPECTRUM_RW_BUFFER_SLOT);
+RWTexture2DArray<float4> _HtRealBufferRW : register(HT_REAL_RW_BUFFER_SLOT);
+RWTexture2DArray<float4> _HtImaginaryBufferRW : register(HT_IMAGINARY_RW_BUFFER_SLOT);
+RWTexture2DArray<float4> _SurfaceGradientRW : register(SURFACE_GRADIENT_MIP0_SLOT);
+RWTexture2DArray<float4> _SurfaceGradientMip1RW : register(SURFACE_GRADIENT_MIP1_SLOT);
+RWTexture2DArray<float4> _SurfaceGradientMip2RW : register(SURFACE_GRADIENT_MIP2_SLOT);
+RWTexture2DArray<float4> _SurfaceGradientMip3RW : register(SURFACE_GRADIENT_MIP3_SLOT);
+RWTexture2DArray<float4> _SurfaceGradientMip4RW : register(SURFACE_GRADIENT_MIP4_SLOT);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void InitializeSpectrum(uint3 thread : SV_DispatchThreadID)
+{
+    // This water offset ensures that when we switch the resolution the spectrum stays about the same
+    uint3 sampleCoordinate = uint3(thread.xy, thread.z);
+
+    // We need 4 random numbers from the sample coords
+    float4 rn = hash_function_float4(sampleCoordinate + NOISE_FUNCTION_OFFSET);
+
+    // First part of the phillips spectrum term
+    float2 E = ONE_OVER_SQRT2 * float2(gaussian_distribution(rn.x, rn.y), gaussian_distribution(rn.z, rn.w));
+
+    // Second part of the phillips spectrum term
+    float2 k = TWO_PI * (thread.xy - _SimulationRes * 0.5) / _PatchSize[thread.z];
+    float2 windDirection = -orientation_to_direction(_PatchWindOrientation[thread.z]);
+    float P = phillips_spectrum(k, windDirection, _PatchWindSpeed[thread.z], _PatchDirectionDampener[thread.z], _PatchSize[thread.z]);
+
+    // Combine and output
+    _SpectrumBufferRW[int3(thread.xyz)] = E * sqrt(P);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void Dispersion(uint3 currentThread : SV_DispatchThreadID)
+{
+    float2 k = TWO_PI * (currentThread.xy - _SimulationRes * 0.5) / _PatchSize[currentThread.z];
+    float  kl = length(k);
+    float  w = sqrt(EARTH_GRAVITY * kl);
+    float2 kx = float2(k.x / kl, 0.0);
+    float2 ky = float2(k.y / kl, 0.0);
+
+    float2 h0 = _SpectrumBuffer.Load(int4(currentThread.xy, currentThread.z, 0));
+    float2 ht = complex_mult(h0, complex_exp(w * _SimulationTime));
+    float2 dx = complex_mult(complex_mult(float2(0, -1), kx), ht);
+    float2 dy = complex_mult(complex_mult(float2(0, -1), ky), ht);
+
+    if (dx.x != dx.x) dx.x = 0.f;
+    if (dx.y != dx.y) dx.y = 0.f;
+    if (dy.x != dy.x) dy.x = 0.f;
+    if (dy.y != dy.y) dy.y = 0.f;
+
+    // TODO: This is a work around to handle singularity at origin.
+    uint halfBandResolution = _SimulationRes / 2;
+    if((currentThread.x == halfBandResolution) && (currentThread.y == halfBandResolution))
+    {
+        dx = float2(0, 0);
+        dy = float2(0, 0);
+    }
+
+    _HtRealBufferRW[int3(currentThread.xy, currentThread.z)] = float4(ht.x, dx.x, dy.x, 0);
+    _HtImaginaryBufferRW[int3(currentThread.xy, currentThread.z)] = float4(ht.y, dx.y, dy.y, 0);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void EvaluateSurfaceGradients(uint3 currentThread : SV_DispatchThreadID)
+{
+    // Extract the information about the pixel to process
+    uint2 coord = currentThread.xy;
+    uint bandIdx = currentThread.z;
+
+    // Get the displacement we need for the evaluate (and re-order them)
+    float3 displacementCenter = ShuffleDisplacement(_DisplacementBuffer.Load(int4(coord, bandIdx, 0)).xyz);
+    float3 displacementRight = ShuffleDisplacement(_DisplacementBuffer.Load(int4(uint2(coord + int2(1, 0)) & (_SimulationRes - 1), bandIdx, 0)).xyz);
+    float3 displacementUp = ShuffleDisplacement(_DisplacementBuffer.Load(int4(uint2(coord + int2(0, 1)) & (_SimulationRes - 1), bandIdx, 0)).xyz);
+
+    // Evaluate the displacement normalization factor and pixel size
+    float pixelSize = _PatchSize[bandIdx] / _SimulationRes;
+
+    // Apply the half choppiness
+    displacementCenter.xz *= _Choppiness * 0.7;
+    displacementRight.xz *= _Choppiness * 0.7;
+    displacementUp.xz *= _Choppiness * 0.7;
+    
+    // Do the amplification
+    displacementCenter.y *= _Amplification;
+    displacementRight.y *= _Amplification;
+    displacementUp.y *= _Amplification;
+
+    // We evaluate the displacement without the choppiness as it doesn't behave properly for distance surfaces
+    float3 p0, p1, p2;
+    EvaluateDisplacedPoints(displacementCenter, displacementRight, displacementUp, pixelSize, p0, p1, p2);
+
+    // Compute the surface gradients of this band
+    _SurfaceGradientRW[int3(coord, bandIdx)] = float4(evaluate_surface_gradients(p0, p1, p2), 1.0);
+}
+
+// Shared memory used for the reduction
+groupshared float3 gs_mipCache[WORKGROUP_SIZE];
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void BuildMipMaps(uint3 currentThread : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Extract the information about the pixel to process
+    uint2 coord = currentThread.xy;
+    uint bandIdx = currentThread.z;
+
+    // Combine the mip0 to produce the mip1
+    float3 mipVal = _SurfaceGradientRW[int3(coord * 2 , bandIdx)].xyz;
+    mipVal += _SurfaceGradientRW[int3(coord * 2 + uint2(1, 0), bandIdx)].xyz;
+    mipVal += _SurfaceGradientRW[int3(coord * 2 + uint2(0, 1), bandIdx)].xyz;
+    mipVal += _SurfaceGradientRW[int3(coord * 2 + uint2(1, 1), bandIdx)].xyz;
+    mipVal *= 0.25f;
+
+    // Store it into the LDS
+    gs_mipCache[groupIndex] = mipVal;
+
+    // Output to the mip1 texture
+    _SurfaceGradientMip1RW[int3(coord, bandIdx)] = float4(mipVal, 1.0);
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // X and Y are even
+    if ((groupIndex & 0x9) == 0)
+    {
+        // Combine the mip1 to produce the mip2
+        mipVal += gs_mipCache[groupIndex + 1];
+        mipVal += gs_mipCache[groupIndex + 8];
+        mipVal += gs_mipCache[groupIndex + 9];
+        mipVal *= 0.25;
+
+        // Store it into the LDS
+        gs_mipCache[groupIndex] = mipVal;
+
+        // Output to the mip2 texture
+        _SurfaceGradientMip2RW[int3(coord / 2, bandIdx)] = float4(mipVal, 1.0);
+    }
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // X and Y are multiples of four
+    if ((groupIndex & 0x1b) == 0)
+    {
+        // Combine the mip2 to produce the mip3
+        mipVal += gs_mipCache[groupIndex + 2];
+        mipVal += gs_mipCache[groupIndex + 16];
+        mipVal += gs_mipCache[groupIndex + 18];
+        mipVal *= 0.25;
+
+        // Store it into the LDS
+        gs_mipCache[groupIndex] = mipVal;
+
+        // Output to the mip3 texture
+        _SurfaceGradientMip3RW[int3(coord / 4, bandIdx)] = float4(mipVal, 1.0);
+    }
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // One thread for the whole group
+    if (groupIndex == 0)
+    {
+        // Combine the mip3 to produce the mip4
+        mipVal += gs_mipCache[groupIndex + 4];
+        mipVal += gs_mipCache[groupIndex + 32];
+        mipVal += gs_mipCache[groupIndex + 36];
+        mipVal *= 0.25;
+
+        // Output to the mip4 texture
+        _SurfaceGradientMip4RW[int3(coord / 8, bandIdx)] = float4(mipVal, 1.0);
+    }
+}

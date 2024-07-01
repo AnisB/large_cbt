@@ -1,0 +1,92 @@
+#define WORKRGROUP_SIZE 64
+
+// Initial include
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define GEOMETRY_CB_BINDING_SLOT CBV_SLOT(1)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(2)
+#define MOON_CB_BINDING_SLOT CBV_SLOT(3)
+
+// SRVs
+#define ELEVATION_TEXTURE_BINDING_SLOT SRV_SLOT(0)
+#define DETAIL_TEXTURE_BINDING_SLOT SRV_SLOT(1)
+#define INDEXED_BISECTOR_BUFFER_BINDING_SLOT SRV_SLOT(2)
+#define INDIRECT_DRAW_BUFFER_BINDING_SLOT SRV_SLOT(3)
+
+// UAVs
+#define LEB_VERTEX_BUFFER_SLOT UAV_SLOT(0)
+#define CURRENT_VERTEX_BUFFER_SLOT UAV_SLOT(1)
+#define CURRENT_DISPLACEMENT_BUFFER_SLOT UAV_SLOT(2)
+
+// Samplers
+#define DETAIL_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/moon_detail.hlsl"
+
+// SRVs
+Texture2D<float> _ElevationTexture: register(ELEVATION_TEXTURE_BINDING_SLOT);                                   // SRV
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);                  // SRV
+StructuredBuffer<uint> _IndirectDrawBuffer: register(INDIRECT_DRAW_BUFFER_BINDING_SLOT);                        // SRV
+
+// UAVs
+RWStructuredBuffer<REAL3_DP> _LEBPositionBuffer: register(LEB_VERTEX_BUFFER_SLOT);                               // UAV
+RWStructuredBuffer<float3> _CurrentPositionBuffer: register(CURRENT_VERTEX_BUFFER_SLOT);                        // UAV
+RWStructuredBuffer<float3> _CurrentDisplacementBuffer: register(CURRENT_DISPLACEMENT_BUFFER_SLOT);              // UAV
+
+[numthreads(WORKRGROUP_SIZE, 1, 1)]
+void EvaluateDeformation(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _IndirectDrawBuffer[9] * 4)
+        return;
+
+    // Extract the bisector ID and the vertexID
+    uint bisectorID = currentID / 4;
+    uint localVertexID = currentID % 4;
+
+    // Operate the indirection
+    bisectorID = _IndexedBisectorBuffer[bisectorID];
+
+    // Evaluate the source vertex
+    currentID = localVertexID < 3 ? bisectorID * 3 + localVertexID : 3 * _TotalNumElements + bisectorID;
+
+    // Grab the position that we will be displacing
+    REAL3_DP positionWS = _LEBPositionBuffer[currentID];
+    float3 positionRWS = float3(positionWS - _CameraPosition);
+
+    // Convert it to planet space for picking the UVs
+    REAL3_DP positionPS = positionWS - _PlanetCenter;
+
+    // Evaluate the normal normalized planet space
+    REAL3_DP normalPS = evaluate_normalized_planet_space(positionPS, _PlanetRadius);
+
+    // Evaluate the UV mapping for sampling
+    REAL2_DP sampleNUV = project_position_to_disk(normalPS);
+
+    // Evaluate the displacements for this vertex
+    REAL2_DP sampleUV = sampleNUV * _PlanetRadius;
+    float equatorDist = saturate(abs(float(normalPS.y)) * 10000);
+
+    // Compute the lat long sampling coords
+    REAL2_DP lonlat = normalized_coordinates_to_longlat(normalPS);
+
+    // Elevation, convert to KMs
+    float displacement = bilinear_interpolation(_ElevationTexture, lonlat) * 1000;
+
+    // Temporary fix due to wrapping in the texture
+    if (lonlat.y < 0.00017) displacement = 0.0f;
+
+    // Add the displacement
+    EvaluateDetail(sampleUV, _PatchSize, _PatchAmplitude, _NumOctaves, positionRWS, float3(normalPS), _Attenuation, displacement);
+
+    // Apply it
+    float3 displacementPS = float3(displacement * normalPS);
+
+    // Export the deformed position
+    _CurrentPositionBuffer[currentID] = positionRWS + displacementPS;
+    _CurrentDisplacementBuffer[currentID] = displacementPS;
+}

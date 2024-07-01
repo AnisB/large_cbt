@@ -1,0 +1,132 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// Initial include
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+#define MOON_CB_BINDING_SLOT CBV_SLOT(2)
+
+// SRVs
+#define CURRENT_VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define ALBEDO_TEXTURE_SLOT SRV_SLOT(2)
+#define ELEVATION_SG_TEXTURE_SLOT SRV_SLOT(3)
+#define DETAIL_SG_TEXTURE_BINDING_SLOT SRV_SLOT(4)
+#define VISIBILITY_TEXTURE_BINDING_SLOT SRV_SLOT(5)
+#define SHADOW_TEXTURE_BINDING_SLOT SRV_SLOT(6)
+
+// UAVs
+#define COLOR_TEXTURE_BINDING_SLOT UAV_SLOT(0)
+
+// Samplers
+#define SAMPLER_LINEAR_WRAP_BINDING_SLOT SPL_SLOT(0)
+#define DETAIL_SG_SAMPLER_BINDING_SLOT SPL_SLOT(1)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/moon_detail_normal.hlsl"
+#include "shader_lib/visibility_buffer.hlsl"
+#include "shader_lib/oren_nayar.hlsl"
+#define SKY_NOT_SUPPORTED
+#include "shader_lib/lighting_evaluation.hlsl"
+
+// Input buffers
+StructuredBuffer<float3> _CurrentVertexBuffer: register(CURRENT_VERTEX_BUFFER_BINDING_SLOT);                // SRV
+StructuredBuffer<float3> _CurrentDisplacementBuffer: register(CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT);    // SRV
+Texture2D<float4> _AbledoTexture: register(ALBEDO_TEXTURE_SLOT);                                            // SRV
+Texture2D<float4> _ElevationSGTexture: register(ELEVATION_SG_TEXTURE_SLOT);                                 // SRV
+Texture2D<uint4> _VisibilityBuffer: register(VISIBILITY_TEXTURE_BINDING_SLOT);                              // SRV
+
+// UAVs
+RWTexture2D<float4> _ColorBufferRW: register(COLOR_TEXTURE_BINDING_SLOT);
+
+// Samplers
+SamplerState sampler_linear_wrap : register(SAMPLER_LINEAR_WRAP_BINDING_SLOT);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void EvaluateMaterial(uint2 threadID : SV_DispatchThreadID)
+{
+    // Read the visibility buffer value
+    uint4 visBuffer = _VisibilityBuffer.Load(int3(threadID.xy, 0));
+
+    // Unpack the barycentrics
+    float3 baryCentrics;
+    uint materialID;
+    uint triangleID;
+    unpack_visibility_buffer(visBuffer, baryCentrics, materialID, triangleID);
+
+    // If this not a valid earth pixel
+    if (materialID != MOON_MATERIAL)
+        return;
+
+    // Evaluate the displacement
+    float3 p0 = _CurrentVertexBuffer[triangleID * 3 + 2];
+    float3 p1 = _CurrentVertexBuffer[triangleID * 3 + 1];
+    float3 p2 = _CurrentVertexBuffer[triangleID * 3 + 0];
+
+    // Interpolate the distance
+    float3 positionRWS = p0 * baryCentrics.x + p1 * baryCentrics.y + p2 * baryCentrics.z;
+
+    // Evaluate the displacement
+    float3 dis0 = _CurrentDisplacementBuffer[triangleID * 3 + 2];
+    float3 dis1 = _CurrentDisplacementBuffer[triangleID * 3 + 1];
+    float3 dis2 = _CurrentDisplacementBuffer[triangleID * 3 + 0];
+
+    // Interpolate the distance
+    float3 displacement = dis0 * baryCentrics.x + dis1 * baryCentrics.y + dis2 * baryCentrics.z;
+
+    // Evaluate the original planet space position
+    REAL3_DP positionOPS = REAL3_DP(positionRWS - displacement) + _CameraPosition - _PlanetCenter;
+
+    // Normalize planet space
+    REAL3_DP posNPS = positionOPS / _PlanetRadius;
+    float3 geometricNormal = float3(posNPS);
+
+    // Data required for the lighting
+    BSDFData bsdfData;
+
+    // Evaluate the distance to camera
+    float distanceToCamera = length(positionRWS);
+
+    // View vector
+    bsdfData.viewWS = -positionRWS / max(distanceToCamera, 0.00001);
+
+    // Simple diffuse color for now
+    REAL2_DP lonlat = normalized_coordinates_to_longlat(posNPS);
+    bsdfData.diffuseColor = _AbledoTexture.Sample(sampler_linear_wrap, float2(lonlat)).xyz;
+
+    // Evaluate the sample UV
+    REAL2_DP sampleNUV = project_position_to_disk(posNPS);
+
+    // Compute the local vector
+    float3x3 localFrame = get_local_frame(geometricNormal, (float2)sampleNUV);
+
+    // Evaluate the displacements for this vertex
+    REAL2_DP sampleUV = sampleNUV * _PlanetRadius;
+
+    // Evaluate the detail SG
+    float3 detailSG = EvaluateDetailSG(sampleUV, _PatchSize, _PatchAmplitude, _NumOctaves, localFrame, distanceToCamera, _Attenuation);
+    detailSG = surface_gradient_from_perturbed_normal(geometricNormal, detailSG);
+
+    // Sample the sg of the elevation
+    float3 sg = _ElevationSGTexture.SampleLevel(sampler_linear_wrap, float2(lonlat), 0).xyz;
+
+    // Combine to generate the normal
+    bsdfData.normalWS = normalize(geometricNormal - sg - detailSG);
+    bsdfData.roughness = 0.8f;
+
+    // Check if we need to patch the normal
+    float NdotV = sanitize_normal(bsdfData.normalWS, bsdfData.viewWS, positionRWS);
+
+    // Evaluate the light color
+    float3 lightColor = float3(1.0, 1.0, 1.0);
+
+    // Evaluate the direct lighting
+    float3 lighting = EvaluateDirectLighting(bsdfData, NdotV, _SunDirection, lightColor);
+    
+    // Output to the color buffer
+    _ColorBufferRW[threadID.xy] = float4(lighting, 1.0);
+}

@@ -1,0 +1,93 @@
+// Dispatch parameters
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// Includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(2)
+#define DEFORMATION_CB_BINDING_SLOT CBV_SLOT(3)
+
+// SRVs
+#define VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define DISPLACEMENT_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define TRANSMITTANCE_LUT_TEXTURE_BINDING_SLOT SRV_SLOT(2)
+#define MULTI_SCATTERING_LUT_TEXTURE_BINDING_SLOT SRV_SLOT(3)
+#define SURFACE_GRADIENT_BUFFER_BINDING_SLOT SRV_SLOT(4)
+#define VISIBILITY_TEXTURE_BINDING_SLOT SRV_SLOT(5)
+
+// UAVs
+#define COLOR_TEXTURE_BINDING_SLOT UAV_SLOT(0)
+
+// Samplers
+#define SURFACE_GRADIENT_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+#define SKY_SAMPLER_BINDING_SLOT SPL_SLOT(1)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#define ENABLE_WRAP_LIGHTING
+#include "shader_lib/disney.hlsl"
+#include "shader_lib/lighting_evaluation.hlsl"
+#include "shader_lib/sg_utilities.hlsl"
+#include "shader_lib/visibility_buffer.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _CurrentVertexBuffer: register(VERTEX_BUFFER_BINDING_SLOT);
+StructuredBuffer<float3> _CurrentDisplacementBuffer: register(DISPLACEMENT_BUFFER_BINDING_SLOT);
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_BINDING_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_BINDING_SLOT);
+Texture2D<uint4> _VisibilityBuffer: register(VISIBILITY_TEXTURE_BINDING_SLOT);
+
+// UAVs
+RWTexture2D<float4> _ColorBufferRW: register(COLOR_TEXTURE_BINDING_SLOT);
+
+// Samplers
+SamplerState sky_sampler_linear_clamp : register(SKY_SAMPLER_BINDING_SLOT);
+
+// Last includes
+#include "shader_lib/earth_utilities.hlsl"
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void EvaluateMaterial(uint2 threadID : SV_DispatchThreadID)
+{
+    // Read the visibility buffer value
+    uint4 visBuffer = _VisibilityBuffer.Load(int3(threadID.xy, 0));
+
+    // Unpack the barycentrics
+    float3 baryCentrics;
+    uint materialID;
+    uint triangleID;
+    unpack_visibility_buffer(visBuffer, baryCentrics, materialID, triangleID);
+
+    // If this not a valid earth pixel
+    if (materialID != EARTH_MATERIAL)
+        return;
+
+    // Evaluate the displacement
+    float3 p0 = _CurrentVertexBuffer[triangleID * 3 + 2];
+    float3 p1 = _CurrentVertexBuffer[triangleID * 3 + 1];
+    float3 p2 = _CurrentVertexBuffer[triangleID * 3 + 0];
+
+    // Interpolate the distance
+    float3 positionRWS = p0 * baryCentrics.x + p1 * baryCentrics.y + p2 * baryCentrics.z;
+
+    // Evaluate the displacement
+    float3 dis0 = _CurrentDisplacementBuffer[triangleID * 3 + 2];
+    float3 dis1 = _CurrentDisplacementBuffer[triangleID * 3 + 1];
+    float3 dis2 = _CurrentDisplacementBuffer[triangleID * 3 + 0];
+
+    // Interpolate the distance
+    float3 displacement = dis0 * baryCentrics.x + dis1 * baryCentrics.y + dis2 * baryCentrics.z;
+
+    // Evaluate the original planet space position
+    REAL3_DP positionOPS = REAL3_DP(positionRWS - displacement) + _CameraPosition - _PlanetCenter;
+
+    // Evaluate the direct lighting
+    float3 lighting = evaluate_earth_lighting(positionOPS, positionRWS);
+    
+    // Output to the color buffer
+    _ColorBufferRW[threadID.xy] = float4(lighting, 1.0);
+}

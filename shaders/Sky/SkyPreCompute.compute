@@ -1,0 +1,240 @@
+// Initial includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(1)
+
+// SRVs
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT SRV_SLOT(0)
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT SRV_SLOT(1)
+
+// UAVs
+#define TRANSMITTANCE_LUT_RW_TEXTURE_SLOT UAV_SLOT(0)
+#define MULTI_SCATTERING_LUT_RW_TEXTURE_SLOT UAV_SLOT(1)
+#define SKY_VIEW_LUT_RW_TEXTURE_SLOT UAV_SLOT(2)
+
+// Samplers
+#define SKY_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+
+// Other Includes
+#include "shader_lib/constant_buffers.hlsl"
+#define SKY_VIEW_EVAL
+#include "shader_lib/sky_utilities.hlsl"
+
+// SRVs
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_SLOT);
+
+// UAVs
+RWTexture2D<float4> _TransmittanceLUTTextureRW: register(TRANSMITTANCE_LUT_RW_TEXTURE_SLOT);
+RWTexture2D<float4> _MultiScatteringLUTTextureRW: register(MULTI_SCATTERING_LUT_RW_TEXTURE_SLOT);
+RWTexture2D<float4> _SkyViewLUTTextureRW: register(SKY_VIEW_LUT_RW_TEXTURE_SLOT);
+
+// Samplers
+SamplerState sampler_linear_clamp : register(SKY_SAMPLER_BINDING_SLOT);
+
+[numthreads(8, 8, 1)]
+void TransmittanceLUT(uint3 threadID : SV_DispatchThreadID)
+{
+    // UV of this pixel
+    float2 uv = (threadID.xy + float2(0.5, 0.5)) / float2(TRANSMITTANCE_TEXTURE_WIDTH, TRANSMITTANCE_TEXTURE_HEIGHT);
+
+    // Compute camera position from LUT coords
+    float viewHeight;
+    float viewZenithCosAngle;
+    UvToLutTransmittanceParams(uv, viewHeight, viewZenithCosAngle);
+
+    //  A few extra needed constants
+    float3 WorldPos = float3(0.0f, 0.0f, viewHeight);
+    float3 WorldDir = float3(0.0f, sqrt(1.0 - viewZenithCosAngle * viewZenithCosAngle), viewZenithCosAngle);
+
+    // Evaluate the transmittance
+    float3 transmittance = exp(-IntegrateOpticalDepth(threadID.xy, WorldPos, WorldDir));
+
+    // Export the transmittance
+    _TransmittanceLUTTextureRW[threadID.xy] = float4(transmittance, 1.0f);
+}
+
+// Shared memory required for the evaluation
+groupshared float3 MultiScatAs1SharedMem[64];
+groupshared float3 LSharedMem[64];
+
+[numthreads(1, 1, 64)]
+void MultiScatteringLUT(uint3 threadID : SV_DispatchThreadID)
+{
+    // Shift the position by half a pixel
+    float2 pixPos = float2(threadID.xy) + float2(0.5f, 0.5);
+
+    // UV of this pixel
+    float2 uv = pixPos / MULTI_SCATTERING_TEXTURE_RESOLUTION;
+
+    // Convert to units
+    uv = float2(fromSubUvsToUnit(uv.x, MULTI_SCATTERING_TEXTURE_RESOLUTION), fromSubUvsToUnit(uv.y, MULTI_SCATTERING_TEXTURE_RESOLUTION));
+
+    // Evaluate the sun direction for this pixel
+    float cosSunZenithAngle = uv.x * 2.0 - 1.0;
+    float3 sunDir = float3(0.0, sqrt(saturate(1.0 - cosSunZenithAngle * cosSunZenithAngle)), cosSunZenithAngle);
+
+    // We adjust again viewHeight according to PLANET_RADIUS_OFFSET to be in a valid range.
+    float viewHeight = _BottomRadius + saturate(uv.y + PLANET_RADIUS_OFFSET) * (_TopRadius - _BottomRadius - PLANET_RADIUS_OFFSET);
+
+    // Ray data
+    float3 WorldPos = float3(0.0f, 0.0f, viewHeight);
+    float3 WorldDir = float3(0.0f, 0.0f, 1.0f);
+
+    // Reference. Since there are many sample, it requires MULTI_SCATTERING_POWER_SERIE to be true for accuracy and to avoid divergences (see declaration for explanations)
+    const uint sqrt_sample_count = 8;
+    const float sqrtSample = float(sqrt_sample_count);
+    float i = 0.5f + float(threadID.z / sqrt_sample_count);
+    float j = 0.5f + float(threadID.z - float((threadID.z / sqrt_sample_count) * sqrt_sample_count));
+    float randA = i / sqrtSample;
+    float randB = j / sqrtSample;
+    float theta = 2.0f * PI * randA;
+    float phi = acos(1.0f - 2.0f * randB);  // uniform distribution https://mathworld.wolfram.com/SpherePointPicking.html
+
+    float cosPhi = cos(phi);
+    float sinPhi = sin(phi);
+    float cosTheta = cos(theta);
+    float sinTheta = sin(theta);
+    WorldDir.x = cosTheta * sinPhi;
+    WorldDir.y = sinTheta * sinPhi;
+    WorldDir.z = cosPhi;
+
+    // Evaluate the luminance and the multi scattering
+    float3 luminance;
+    float3 multiScat;
+    IntegrateLuminanceMultiScatt(pixPos, WorldPos, WorldDir, sunDir, _TransmittanceLUTTexture, sampler_linear_clamp, luminance, multiScat);
+
+    // Store into the shared memory
+    const float SphereSolidAngle = 4.0 * PI;
+    MultiScatAs1SharedMem[threadID.z] = multiScat * SphereSolidAngle / (sqrtSample * sqrtSample);
+    LSharedMem[threadID.z] = luminance * SphereSolidAngle / (sqrtSample * sqrtSample);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // 64 to 32
+    if (threadID.z < 32)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 32];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 32];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 32 to 16
+    if (threadID.z < 16)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 16];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 16];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 16 to 8 (16 is thread group min hardware size with intel, no sync required from there)
+    if (threadID.z < 8)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 8];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 8];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (threadID.z < 4)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 4];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 4];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (threadID.z < 2)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 2];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 2];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (threadID.z < 1)
+    {
+        MultiScatAs1SharedMem[threadID.z] += MultiScatAs1SharedMem[threadID.z + 1];
+        LSharedMem[threadID.z] += LSharedMem[threadID.z + 1];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (threadID.z > 0)
+        return;
+
+    const float IsotropicPhase = 1.0 / SphereSolidAngle;
+    float3 MultiScatAs1         = MultiScatAs1SharedMem[0] * IsotropicPhase;    // Equation 7 f_ms
+    float3 InScatteredLuminance = LSharedMem[0] * IsotropicPhase;               // Equation 5 L_2ndOrder
+
+    // MultiScatAs1 represents the amount of luminance scattered as if the integral of scattered luminance over the sphere would be 1.
+    //  - 1st order of scattering: one can ray-march a straight path as usual over the sphere. That is InScatteredLuminance.
+    //  - 2nd order of scattering: the inscattered luminance is InScatteredLuminance at each of samples of fist order integration. Assuming a uniform phase function that is represented by MultiScatAs1,
+    //  - 3nd order of scattering: the inscattered luminance is (InScatteredLuminance * MultiScatAs1 * MultiScatAs1)
+    //  - etc.
+    // For a serie, sum_{n=0}^{n=+inf} = 1 + r + r^2 + r^3 + ... + r^n = 1 / (1.0 - r), see https://en.wikipedia.org/wiki/Geometric_series 
+    const float3 r = MultiScatAs1;
+    const float3 SumOfAllMultiScatteringEventsContribution = 1.0f / (1.0 - r);
+    float3 L = InScatteredLuminance * SumOfAllMultiScatteringEventsContribution;// Equation 10 Psi_ms
+
+    // Write to the output texture
+    _MultiScatteringLUTTextureRW[threadID.xy] = float4(MULTIPLE_SCATTERING_FACTOR * L, 1.0f);
+}
+
+[numthreads(8, 8, 1)]
+void SkyViewLUT(uint3 threadID : SV_DispatchThreadID)
+{
+    // Only process pixels in the texture range
+    if (threadID.x >= SKY_VIEW_LUT_TEXTURE_WIDTH || threadID.y >= SKY_VIEW_LUT_TEXTURE_HEIGHT)
+        return;
+
+    // Shift the position by half a pixel
+    float2 pixPos = float2(threadID.xy) + float2(0.5f, 0.5);
+
+    // UV of this pixel
+    float2 uv = pixPos / float2(SKY_VIEW_LUT_TEXTURE_WIDTH, SKY_VIEW_LUT_TEXTURE_HEIGHT);
+
+    // Build the world space position from it
+    float3 depthBufferPosition = evaluate_world_space_position(uv, 0.5, _InvViewProjectionMatrix);
+
+    // Compute the world direction and world position
+    float distanceToCamera = length(depthBufferPosition);
+    float3 WorldDir = depthBufferPosition / max(distanceToCamera, 0.000001);
+    float3 WorldPos = float3(_CameraPosition) / 1000.0;
+
+    // Sky view lut parameters
+    float viewHeight = length(WorldPos);
+    float viewZenithCosAngle;
+    float lightViewCosAngle;
+    UvToSkyViewLutParams(viewZenithCosAngle, lightViewCosAngle, viewHeight, uv);
+
+    // evaluate the sun direction
+    float3 SunDir;
+    {
+        float3 UpVector = WorldPos / viewHeight;
+        float sunZenithCosAngle = clamp(dot(UpVector, _SunDirection), -1.0, 1.0);
+        SunDir = normalize(float3(sqrt(1.0 - sunZenithCosAngle * sunZenithCosAngle), 0.0, sunZenithCosAngle));
+    }
+
+    WorldPos = float3(0.0f, 0.0f, viewHeight);
+
+    float viewZenithSinAngle = sqrt(1 - viewZenithCosAngle * viewZenithCosAngle);
+    WorldDir = float3(
+        viewZenithSinAngle * lightViewCosAngle,
+        viewZenithSinAngle * sqrt(1.0 - lightViewCosAngle * lightViewCosAngle),
+        viewZenithCosAngle);
+
+
+    // Move to top atmospehre
+    REAL3_DP WorldPosDP = REAL3_DP(WorldPos);
+    REAL3_DP WorldDirDP = REAL3_DP(WorldDir);
+    if (!MoveToTopAtmosphere(WorldPosDP, WorldDirDP))
+    {
+        // Ray is not intersecting the atmosphere
+        _SkyViewLUTTextureRW[threadID.xy] = float4(0.0, 0.0, 0.0, 1);
+        return;
+    }
+
+    // Evalute the inscattering
+    float3 inScattering, throughput;
+    IntegrateLuminanceThroughput((float3)WorldPosDP, (float3)WorldDirDP, SunDir, 0.0, 0
+        , _TransmittanceLUTTexture, _MultiScatteringLUTTexture, sampler_linear_clamp
+        , inScattering, throughput);
+
+    // export to the texture
+    _SkyViewLUTTextureRW[threadID.xy] = float4(inScattering, luminance(throughput));
+}

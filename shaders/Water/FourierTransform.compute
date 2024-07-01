@@ -1,0 +1,100 @@
+// Includes
+#include "shader_lib/common.hlsl"
+
+// SRVS
+#define REAL_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define IMAGINARY_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define FOURIER_TRANSFORM_SRV_COUNT 2
+
+// UAVs
+#define REAL_RW_BUFFER_BINDING_SLOT UAV_SLOT(0)
+#define IMAGINARY_RW_BUFFER_BINDING_SLOT UAV_SLOT(1)
+#define FOURIER_TRANSFORM_UAV_COUNT 2
+
+#define SIMULATION_RESOLUTION 256
+#define BUTTERFLY_PASSES 8
+
+// SRVs
+Texture2DArray<float4> _FFTRealBuffer : register(REAL_BUFFER_BINDING_SLOT);
+Texture2DArray<float4> _FFTImaginaryBuffer : register(IMAGINARY_BUFFER_BINDING_SLOT);
+
+// UAVs
+RWTexture2DArray<float4> _FFTRealBufferRW : register(REAL_RW_BUFFER_BINDING_SLOT);
+RWTexture2DArray<float4> _FFTImaginaryBufferRW: register(IMAGINARY_RW_BUFFER_BINDING_SLOT);
+
+// SLM used to avoid having multiple dispatches per dimension
+groupshared float3 pingPongArray[4][SIMULATION_RESOLUTION];
+
+void GetButterflyValues(uint passIndex, uint x, out uint2 indices, out float2 weights)
+{
+    uint sectionWidth = 2u << passIndex;
+    uint halfSectionWidth = sectionWidth / 2;
+
+    uint sectionStartOffset = x & ~(sectionWidth - 1);
+    uint halfSectionOffset = x & (halfSectionWidth - 1);
+    uint sectionOffset = x & (sectionWidth - 1);
+
+    sincos(TWO_PI * sectionOffset / (float)sectionWidth, weights.y, weights.x);
+    weights.y = -weights.y;
+
+    indices.x = sectionStartOffset + halfSectionOffset;
+    indices.y = sectionStartOffset + halfSectionOffset + halfSectionWidth;
+
+    if (passIndex == 0)
+        indices = reversebits_uint2(indices.xy) >> (32 - BUTTERFLY_PASSES) & (SIMULATION_RESOLUTION - 1);
+}
+
+void ButterflyPass(int passIndex, uint x, uint t0, uint t1, out float3 resultR, out float3 resultI)
+{
+    uint2 indices;
+    float2 weights;
+    GetButterflyValues(passIndex, x, indices, weights);
+
+    float3 inputR1 = pingPongArray[t0][indices.x];
+    float3 inputI1 = pingPongArray[t1][indices.x];
+
+    float3 inputR2 = pingPongArray[t0][indices.y];
+    float3 inputI2 = pingPongArray[t1][indices.y];
+
+    resultR = (inputR1 + weights.x * inputR2 + weights.y * inputI2);
+    resultI = (inputI1 - weights.y * inputR2 + weights.x * inputI2);
+}
+
+[numthreads(SIMULATION_RESOLUTION, 1, 1)]
+void InverseFFT(uint3 id : SV_DispatchThreadID)
+{
+    uint3 position = id;
+
+    #ifdef COLUMN_PASS
+        uint2 texturePos = uint2(position.yx);
+    #else
+        uint2 texturePos = uint2(position.xy);
+    #endif
+
+    // Load entire row or column into scratch array
+    pingPongArray[0][position.x].xyz = _FFTRealBuffer.Load(int4(texturePos, id.z, 0)).xyz;
+    pingPongArray[1][position.x].xyz = _FFTImaginaryBuffer.Load(int4(texturePos, id.z, 0)).xyz;
+
+    uint4 textureIndices = uint4(0, 1, 2, 3);
+    for (int i = 0; i < BUTTERFLY_PASSES - 1; i++)
+    {
+        GroupMemoryBarrierWithGroupSync();
+        ButterflyPass(i, position.x, textureIndices.x, textureIndices.y, pingPongArray[textureIndices.z][position.x].xyz, pingPongArray[textureIndices.w][position.x].xyz);
+        textureIndices.xyzw = textureIndices.zwxy;
+    }
+
+    // Final butterfly will write directly to the target texture
+    GroupMemoryBarrierWithGroupSync();
+
+    // The final pass writes to the output UAV texture
+    float3 realValue = 0.0;
+    float3 imaginaryValue = 0.0;
+    ButterflyPass(BUTTERFLY_PASSES - 1, position.x, textureIndices.x, textureIndices.y, realValue, imaginaryValue);
+#if defined(COLUMN_PASS)
+    float sign_correction_and_normalization = ((position.x + position.y) & 0x01) ? -1.0 : 1.0;
+    _FFTRealBufferRW[int3(texturePos, id.z)] = float4(realValue * sign_correction_and_normalization, 0.0);
+#else
+    _FFTRealBufferRW[int3(texturePos, id.z)] = float4(realValue, 0.0);
+    _FFTImaginaryBufferRW[int3(texturePos, id.z)] = float4(imaginaryValue, 0.0);
+#endif
+}

@@ -1,0 +1,93 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// UAVs
+#define TARGET_TEXTURE_RW_MIP0_SLOT u0
+#define TARGET_TEXTURE_RW_MIP1_SLOT u1
+#define TARGET_TEXTURE_RW_MIP2_SLOT u2
+#define TARGET_TEXTURE_RW_MIP3_SLOT u3
+#define TARGET_TEXTURE_RW_MIP4_SLOT u4
+
+// UAVs
+RWTexture2D<float4> _TargetTextureMip0RW : register(TARGET_TEXTURE_RW_MIP0_SLOT);
+RWTexture2D<float4> _TargetTextureMip1RW : register(TARGET_TEXTURE_RW_MIP1_SLOT);
+RWTexture2D<float4> _TargetTextureMip2RW : register(TARGET_TEXTURE_RW_MIP2_SLOT);
+RWTexture2D<float4> _TargetTextureMip3RW : register(TARGET_TEXTURE_RW_MIP3_SLOT);
+RWTexture2D<float4> _TargetTextureMip4RW : register(TARGET_TEXTURE_RW_MIP4_SLOT);
+
+// Shared memory used for the reduction
+groupshared float4 gs_mipCache[WORKGROUP_SIZE];
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void BuildMips(uint3 currentThread : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Extract the information about the pixel to process
+    uint2 coord = currentThread.xy;
+
+    // Combine the mip0 to produce the mip1
+    float4 mipVal = _TargetTextureMip0RW[int2(coord * 2)];
+    mipVal += _TargetTextureMip0RW[int2(coord * 2 + uint2(1, 0))];
+    mipVal += _TargetTextureMip0RW[int2(coord * 2 + uint2(0, 1))];
+    mipVal += _TargetTextureMip0RW[int2(coord * 2 + uint2(1, 1))];
+    mipVal *= 0.25f;
+
+    // Store it into the LDS
+    gs_mipCache[groupIndex] = mipVal;
+
+    // Output to the mip1 texture
+    _TargetTextureMip1RW[int2(coord)] = mipVal;
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // X and Y are even
+    if ((groupIndex & 0x9) == 0)
+    {
+        // Combine the mip1 to produce the mip2
+        mipVal += gs_mipCache[groupIndex + 1];
+        mipVal += gs_mipCache[groupIndex + 8];
+        mipVal += gs_mipCache[groupIndex + 9];
+        mipVal *= 0.25;
+
+        // Store it into the LDS
+        gs_mipCache[groupIndex] = mipVal;
+
+        // Output to the mip2 texture
+        _TargetTextureMip2RW[int2(coord / 2)] = mipVal;
+    }
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // X and Y are multiples of four
+    if ((groupIndex & 0x1b) == 0)
+    {
+        // Combine the mip2 to produce the mip3
+        mipVal += gs_mipCache[groupIndex + 2];
+        mipVal += gs_mipCache[groupIndex + 16];
+        mipVal += gs_mipCache[groupIndex + 18];
+        mipVal *= 0.25;
+
+        // Store it into the LDS
+        gs_mipCache[groupIndex] = mipVal;
+
+        // Output to the mip3 texture
+        _TargetTextureMip3RW[int2(coord / 4)] = mipVal;
+    }
+
+    // Sync
+    GroupMemoryBarrierWithGroupSync();
+
+    // One thread for the whole group
+    if (groupIndex == 0)
+    {
+        // Combine the mip3 to produce the mip4
+        mipVal += gs_mipCache[groupIndex + 4];
+        mipVal += gs_mipCache[groupIndex + 32];
+        mipVal += gs_mipCache[groupIndex + 36];
+        mipVal *= 0.25;
+
+        // Output to the mip4 texture
+        _TargetTextureMip4RW[int2(coord / 8)] = mipVal;
+    }
+}
