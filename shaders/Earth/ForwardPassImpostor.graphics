@@ -1,0 +1,99 @@
+// Initial include
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(2)
+#define DEFORMATION_CB_BINDING_SLOT CBV_SLOT(3)
+
+// SRVs
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT SRV_SLOT(0)
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT SRV_SLOT(1)
+
+// Samplers
+#define SAMPLER_LINEAR_CLAMP SPL_SLOT(0)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/sky_utilities.hlsl"
+#define ENABLE_WRAP_LIGHTING
+#include "shader_lib/disney.hlsl"
+#include "shader_lib/lighting_evaluation.hlsl"
+
+// SRVs
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_SLOT);
+
+// Samplers
+SamplerState sampler_linear_clamp : register(SAMPLER_LINEAR_CLAMP);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    // Full screen quad
+    VertexOutput output;
+    float2 uv = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+    output.positionCS = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+    return output;
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+float4 frag(PixelInput input) : SV_Target0
+{
+    // Compute the virtual position of the pixel
+    float3 rayDirection = get_ray_direction(input.positionCS.xy * _ScreenSize.zw, _InvViewProjectionMatrix);
+
+    // Intersect with the planet
+    float planetIntersection = ray_sphere_intersect_nearest((float3)_CameraPosition, rayDirection, _PlanetCenter, _PlanetRadius);
+    
+    // This thread doesn't intersect the planet, we're done
+    if (planetIntersection == -1.0)
+        discard;
+
+    // Intersection points
+    REAL3_DP positionWS = _CameraPosition + rayDirection * planetIntersection;
+    REAL3_DP positionPS = positionWS - _PlanetCenter;
+
+    // Data required for the lighting
+    BSDFData bsdfData;
+
+    // View vector
+    bsdfData.viewWS = -rayDirection;
+    bsdfData.normalWS = normalize((float3)positionPS);
+    bsdfData.roughness = _PatchRoughness[0] + _PatchRoughness[1] + _PatchRoughness[2] + _PatchRoughness[3];
+    float NdotV = dot(bsdfData.viewWS, bsdfData.normalWS);
+
+    // Evaluate the reflection vector and attenuation
+    bsdfData.reflectedWS = reflect(-bsdfData.viewWS, bsdfData.normalWS);
+    bsdfData.reflectionAttenuation = 1.0f;
+
+    // Simple diffuse color for now
+    bsdfData.diffuseColor = float3(0.0, 0.02, 0.04);
+
+    // Evaluate the light color
+    float3 lightColor = EvaluateSunLightColor(bsdfData.normalWS, length((float3)positionPS) / 1000.0, _SunDirection, _TransmittanceLUTTexture, sampler_linear_clamp);
+
+    // Lighting accumulation
+    float3 lighting = EvaluateDirectLighting(bsdfData, NdotV, _SunDirection, lightColor);
+    
+    // Add indirect lighting
+    lighting += EvaluateIndirectLighting(bsdfData, (float3)positionPS, _SunDirection, _PlanetRadius, _TransmittanceLUTTexture, _MultiScatteringLUTTexture, sampler_linear_clamp);
+
+    // Output the planet lighting
+    return float4(lighting, 1.0);
+}

@@ -1,0 +1,59 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// Initial includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+
+// SRVs
+#define RTAS_BINDING_SLOT SRV_SLOT(0)
+
+// UAVs
+#define VISIBILITY_BUFFER_BINDING_SLOT UAV_SLOT(0)
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/visibility_buffer.hlsl"
+
+// SRVs
+RaytracingAccelerationStructure _SceneRTAS : register(RTAS_BINDING_SLOT);
+
+// UAVs
+RWTexture2D<uint4> _VisibilityBufferRW: register(VISIBILITY_BUFFER_BINDING_SLOT);
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void VisibilityPass(uint2 threadID : SV_DispatchThreadID)
+{
+    // Ray description
+    RayDesc ray;
+    ray.Origin = float3(0.0, 0.0, 0.0);
+    ray.Direction = get_ray_direction((threadID.xy + float2(0.5, 0.5)) * _ScreenSize.zw, _InvViewProjectionMatrix);
+    ray.TMin = 0.01;
+    ray.TMax = _FarPlaneDistance;
+
+    // Initialize the query
+    RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> query;
+
+    // Set up a trace.  No work is done yet.
+    query.TraceRayInline(_SceneRTAS,  RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xff, ray);
+
+    // Run the traversal
+    query.Proceed();
+
+    // If we didin't miss
+    float2 barycentrics = float2(0.0, 0.0);
+    uint triangleID = 0;
+    uint materialID = 0;
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        // Output to the visibility buffer
+        barycentrics = query.CommittedTriangleBarycentrics().yx;
+        triangleID = query.CommittedPrimitiveIndex();
+        materialID = query.CommittedInstanceIndex() + 1;
+    }
+
+    // Pack and export
+    _VisibilityBufferRW[threadID.xy] = pack_visibility_buffer(barycentrics, materialID, triangleID);
+}

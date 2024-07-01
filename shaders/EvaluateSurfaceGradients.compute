@@ -1,0 +1,82 @@
+#define WORKGROUP_RES 8
+#define WORKGROUP_SIZE WORKGROUP_RES * WORKGROUP_RES
+
+// Includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define MOON_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+
+// SRVs
+#define ELEVATION_TEXTURE_BINDING_SLOT SRV_SLOT(0)
+
+// UAVs
+#define SURFACE_GRADIENT_TEXTURE_BINDING_SLOT UAV_SLOT(0)
+#define SLOPE_TEXTURE_BINDING_SLOT UAV_SLOT(1)
+
+// Samplers
+#define LINEAR_WRAP_SAMPLER_BINDING_SLOT SPL_SLOT(0)
+
+// SRVs
+Texture2D<float> _ElevationTexture: register(ELEVATION_TEXTURE_BINDING_SLOT);
+
+// UAVs
+RWTexture2D<float4> _SurfaceGradientRW: register(SURFACE_GRADIENT_TEXTURE_BINDING_SLOT);
+RWTexture2D<float2> _SlopeBufferRW: register(SLOPE_TEXTURE_BINDING_SLOT);
+
+// Samplers
+SamplerState sampler_linear_wrap : register(LINEAR_WRAP_SAMPLER_BINDING_SLOT);
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void EvaluateSurfaceGradient(uint3 threadID : SV_DispatchThreadID)
+{
+    // Evaluate the cent er pixel UV
+    float2 uv = (threadID.xy + 0.5) / (float2)_ElevationTextureSize;
+    float elevC = _ElevationTexture.SampleLevel(sampler_linear_wrap, uv, 0) * 1000.0f;
+
+    // Evaluate the neighbor's uvs
+    float2 nx_uv = uv + float2(1.0 / _ElevationTextureSize.x, 0.0);
+    float2 ny_uv = uv + float2(0.0, -1.0 / _ElevationTextureSize.y);
+
+    float eleX = _ElevationTexture.SampleLevel(sampler_linear_wrap, nx_uv, 0) * 1000.0f;
+    float eleY = _ElevationTexture.SampleLevel(sampler_linear_wrap, ny_uv, 0) * 1000.0f;
+
+    // Evaluate the normal of the pixel
+    float3 normal = longlat_to_normalized_coordinates(uv.x, uv.y);
+
+    // Evaluate the displaced central position
+    float3 positionC = normal * (_PlanetRadius + elevC);
+
+    // Evaluate the neighbor's positions
+    float3 neighborX = longlat_to_normalized_coordinates(nx_uv.x, nx_uv.y);
+    float3 neighborY = longlat_to_normalized_coordinates(ny_uv.x, ny_uv.y);
+
+    // Evaluate the deformed normal
+    float3 v0 = neighborX * (_PlanetRadius + eleX) - positionC;
+    float3 v1 = neighborY * (_PlanetRadius + eleY) - positionC;
+    float3 pertNormal = normalize(cross(v1, v0));
+
+    // Output the surface gradient
+    _SurfaceGradientRW[threadID.xy] = float4(surface_gradient_from_perturbed_normal(normal, pertNormal), elevC);
+}
+
+[numthreads(WORKGROUP_RES, WORKGROUP_RES, 1)]
+void EvaluateDetailSlope(uint2 coord : SV_DispatchThreadID)
+{
+    // Tap the 4 pixel
+    float left = _ElevationTexture.Load(int3(uint2(coord + int2(-1, 0)) % _DetailTextureSize, 0));
+    float right = _ElevationTexture.Load(int3(uint2(coord + int2(1, 0)) % _DetailTextureSize, 0));
+    float down = _ElevationTexture.Load(int3(uint2(coord + int2(0, -1)) % _DetailTextureSize, 0));
+    float up = _ElevationTexture.Load(int3(uint2(coord + int2(0, 1)) % _DetailTextureSize, 0));
+
+    // Evaluate the two slopes
+    float slope_x = (float)_DetailTextureSize.x * 0.5f * (right - left);
+    float slope_y = (float)_DetailTextureSize.y * 0.5f * (down- up);
+
+    // Compute the surface gradients of this band
+    _SlopeBufferRW[coord] = float2(slope_x, slope_y);
+}

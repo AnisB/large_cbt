@@ -1,0 +1,189 @@
+// Initial include
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define PLANET_CB_BINDING_SLOT CBV_SLOT(1)
+#define MOON_CB_BINDING_SLOT CBV_SLOT(2)
+#define UPDATE_CB_BINDING_SLOT CBV_SLOT(3)
+
+// SRVs
+#define CURRENT_VERTEX_BUFFER_BINDING_SLOT SRV_SLOT(0)
+#define CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT SRV_SLOT(1)
+#define INDEXED_BISECTOR_BUFFER_BINDING_SLOT SRV_SLOT(2)
+#define ALBEDO_TEXTURE_SLOT SRV_SLOT(3)
+#define ELEVATION_SG_TEXTURE_SLOT SRV_SLOT(4)
+#define DETAIL_SG_TEXTURE_BINDING_SLOT SRV_SLOT(5)
+
+// Samplers
+#define SAMPLER_LINEAR_WRAP_BINDING_SLOT SPL_SLOT(0)
+#define DETAIL_SG_SAMPLER_BINDING_SLOT SPL_SLOT(1)
+
+// We don't support the sky
+#define SKY_NOT_SUPPORTED
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/oren_nayar.hlsl"
+#include "shader_lib/lighting_evaluation.hlsl"
+#include "shader_lib/moon_detail_normal.hlsl"
+
+// SRVs
+StructuredBuffer<float3> _CurrentVertexBuffer: register(CURRENT_VERTEX_BUFFER_BINDING_SLOT);                // SRV
+StructuredBuffer<float3> _CurrentDisplacementBuffer: register(CURRENT_DISPLACEMENT_BUFFER_BINDING_SLOT);    // SRV
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);              // SRV
+Texture2D<float4> _AbledoTexture: register(ALBEDO_TEXTURE_SLOT);                                            // SRV
+Texture2D<float4> _ElevationSGTexture: register(ELEVATION_SG_TEXTURE_SLOT);                                 // SRV
+
+// Samplers
+SamplerState sampler_linear_wrap : register(SAMPLER_LINEAR_WRAP_BINDING_SLOT);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    // Initialize the output structure
+    VertexOutput output;
+    output = (VertexOutput)0;
+
+    // Evaluate the properties of this triangle
+    uint triangle_id = input.vertexID / 3;
+    uint local_vert_id = input.vertexID % 3;
+
+    // Operate the indirection
+    triangle_id = _IndexedBisectorBuffer[triangle_id];
+
+    // Which vertex should be read?
+    local_vert_id = local_vert_id == 0 ? 2 : (local_vert_id == 2 ? 0 : 1);
+    REAL3_DP positionRWS = REAL3_DP(_CurrentVertexBuffer[triangle_id * 3 + local_vert_id]) + _UpdateCameraPosition - _CameraPosition;
+    output.positionORWS = float3(positionRWS - _CurrentDisplacementBuffer[triangle_id * 3 + local_vert_id]);
+
+    // Apply the view projection
+    output.positionCS = float4(mul(_ViewProjectionMatrix, float4(positionRWS, 1.0)));
+    output.positionRWS = float3(positionRWS);
+
+    return output;
+}
+
+struct GeometryInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+};
+
+struct GeometryOutput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+    float3 dist : DISTANCE;
+};
+
+[maxvertexcount(3)]
+void geom(triangle GeometryInput input[3], inout TriangleStream<GeometryOutput> outStream)
+{   
+    // Compute the vectors and the area
+    float2 p0 = clip_space_to_pixel(input[0].positionCS, _ScreenSize.xy);
+    float2 p1 = clip_space_to_pixel(input[1].positionCS, _ScreenSize.xy);
+    float2 p2 = clip_space_to_pixel(input[2].positionCS, _ScreenSize.xy);
+    float2 v[3] = {p2 - p1, p2 - p0, p1 - p0};
+    float area = abs(v[1].x * v[2].y - v[1].y * v[2].x);
+
+    // Emit the vertices
+    GeometryOutput output = (GeometryOutput)0;
+    for (uint vertID = 0; vertID < 3; ++vertID)
+    {
+        output.positionCS = input[vertID].positionCS;
+        output.positionRWS = input[vertID].positionRWS;
+        output.positionORWS = input[vertID].positionORWS;
+        output.dist = 0.0;
+        output.dist[vertID] = area * rsqrt(dot(v[vertID],v[vertID]));
+        outStream.Append(output);
+    }
+    outStream.RestartStrip();
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+    float3 positionRWS : POSITION0;
+    float3 positionORWS : POSITION1;
+    float3 dist : DISTANCE;
+};
+
+struct PixelOutput
+{
+    float4 attachment0 : SV_Target0;
+};
+
+PixelOutput frag(PixelInput input)
+{
+    // Evaluate the original planet space position
+    REAL3_DP positionOPS = REAL3_DP(input.positionORWS) + _CameraPosition - _PlanetCenter;
+
+    // Normalize planet space
+    REAL3_DP posNPS = positionOPS / _PlanetRadius;
+    float3 geometricNormal = float3(posNPS);
+
+    // Data required for the lighting
+    BSDFData bsdfData;
+
+    // Evaluate the distance to camera
+    float distanceToCamera = length(input.positionRWS);
+
+    // View vector
+    bsdfData.viewWS = -input.positionRWS / max(distanceToCamera, 0.00001);
+
+    // Simple diffuse color for now
+    REAL2_DP lonlat = normalized_coordinates_to_longlat(posNPS);
+    bsdfData.diffuseColor = _AbledoTexture.Sample(sampler_linear_wrap, float2(lonlat)).xyz;
+
+    // Evaluate the sample UV
+    REAL2_DP sampleNUV = project_position_to_disk(posNPS);
+
+    // Compute the local vector
+    float3x3 localFrame = get_local_frame(geometricNormal, (float2)sampleNUV);
+
+    // Evaluate the displacements for this vertex
+    REAL2_DP sampleUV = sampleNUV * _PlanetRadius;
+
+    // Evaluate the detail SG
+    float3 detailSG = EvaluateDetailSG(sampleUV, _PatchSize, _PatchAmplitude, _NumOctaves, localFrame, distanceToCamera, _Attenuation);
+    detailSG = surface_gradient_from_perturbed_normal(geometricNormal, detailSG);
+    
+    // Sample the sg of the elevation
+    float3 sg = _ElevationSGTexture.Sample(sampler_linear_wrap, float2(lonlat)).xyz;
+
+    // Combine to generate the normal
+    bsdfData.normalWS = normalize(geometricNormal - sg - detailSG);
+    bsdfData.roughness = 0.8f;
+
+    // Check if we need to patch the normal
+    float NdotV = sanitize_normal(bsdfData.normalWS, bsdfData.viewWS, input.positionRWS);
+
+    // Evaluate the light color
+    float3 lightColor = float3(1.0, 1.0, 1.0);
+
+    // Evaluate the direct lighting
+    float3 lighting = EvaluateDirectLighting(bsdfData, NdotV, _SunDirection, lightColor);
+
+    // Evaluate the wireframe
+    lighting = apply_wireframe(lighting, _WireFrameColor, _WireFrameSize, input.dist);
+    
+    // Output the lighting
+    PixelOutput output;
+    output.attachment0 = float4(lighting, 1.0);
+    return output;
+}

@@ -1,0 +1,280 @@
+#define WORKGROUP_SIZE 64
+
+// First include
+#include "shader_lib/common.hlsl"
+#include "shader_lib/update_mesh_root_signature.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#define CAN_USE_SHARED_MEMORY
+#if defined(OCBT_128K)
+#include "shader_lib/OCBT_128k.hlsl"
+#elif defined(OCBT_256K)
+#include "shader_lib/OCBT_256k.hlsl"
+#elif defined(OCBT_512K)
+#include "shader_lib/OCBT_512k.hlsl"
+#elif defined(OCBT_1M)
+#include "shader_lib/OCBT_1m.hlsl"
+#endif
+#include "shader_lib/bisector.hlsl"
+#include "shader_lib/frustum_culling.hlsl"
+
+// Input buffer
+StructuredBuffer<float3> _CurrentVertexBuffer: register(CURRENT_VERTEX_BUFFER_SLOT);                    // SRV
+StructuredBuffer<uint> _IndexedBisectorBuffer: register(INDEXED_BISECTOR_BUFFER_BINDING_SLOT);          // SRV
+
+// Needs to be defined before including update_utilities
+struct BisectorGeometry
+{
+    float3 p[4];
+};
+
+int ClassifyBisector(in BisectorGeometry tri, uint depth)
+{
+    // Check the triangle's visibility
+    float3 triNormal = normalize(cross(tri.p[2] - tri.p[1], tri.p[0] - tri.p[1]));
+    float3 triCenter = (tri.p[0] + tri.p[1] + tri.p[2]) / 3.0;
+    float3 viewDir = normalize(-triCenter);
+    float FdotV = dot(viewDir, _UpdateCameraForward);
+    float VdotN = dot(viewDir, triNormal);
+
+    // Here we don't use 0 as it introduces stability issues at grazing angles
+    if (FdotV < 0.0 && VdotN < -1e-3)
+        return BACK_FACE_CULLED;
+
+    // Compute the triangle's AABB
+    float3 aabbMin = float3(min(min(tri.p[0].x, tri.p[1].x), tri.p[2].x), min(min(tri.p[0].y, tri.p[1].y), tri.p[2].y), min(min(tri.p[0].z, tri.p[1].z), tri.p[2].z));
+    float3 aabbMax = float3(max(max(tri.p[0].x, tri.p[1].x), tri.p[2].x), max(max(tri.p[0].y, tri.p[1].y), tri.p[2].y), max(max(tri.p[0].z, tri.p[1].z), tri.p[2].z));
+
+    // First we do a frustum culling pass
+    if (!FrustumAABBIntersect(_FrustumPlanes, aabbMin, aabbMax))
+        return FRUSTUM_CULLED;
+
+    // Project the points on screen
+    float4 p0P = mul(_UpdateViewProjectionMatrix, float4(tri.p[0], 1.0));
+    p0P.xy = p0P.xy / p0P.w;
+    p0P.xy = (p0P.xy * 0.5 + 0.5);
+
+    float4 p1P = mul(_UpdateViewProjectionMatrix, float4(tri.p[1], 1.0));
+    p1P.xy = p1P.xy / p1P.w;
+    p1P.xy = (p1P.xy * 0.5 + 0.5);
+
+    float4 p2P = mul(_UpdateViewProjectionMatrix, float4(tri.p[2], 1.0));
+    p2P.xy = p2P.xy / p2P.w;
+    p2P.xy = (p2P.xy * 0.5 + 0.5);
+
+    // 2D area of the triangle
+    // here we didn't reverse the sign of the y coordinate at projection time, but we simply adapted the area evaluation
+    // The same way we don't multiply by the screen size before, but after which is equivalent
+    float area = 0.5 * abs(p0P.x * (p2P.y - p1P.y) + p1P.x * (p0P.y - p2P.y) + p2P.x * (p1P.y - p0P.y));
+    area *= _ScreenSize.x * _ScreenSize.y;
+
+    // We over estimate the area at grazing angles
+    float areaOverestimation = lerp(2.0, 1.0, pow(VdotN, 0.2));
+    area *= areaOverestimation;
+
+    // If the triangle's area is bigger than the target size and the depth is not the maximal depth, subdivide
+    if (_TriangleSize < area && depth < _MaxSubdivisionDepth)
+    {
+        // If the area is really big, put it in high priority.
+        return BISECT_ELEMENT;
+    }
+    else if ((_TriangleSize * 0.5 > area) || (depth > _MaxSubdivisionDepth))
+    {
+        // Transform the parent's point
+        float4 p3P = mul(_UpdateViewProjectionMatrix, float4(tri.p[3], 1.0));
+        p3P.xy = p3P.xy / p3P.w;
+        p3P.xy = (p3P.xy * 0.5 + 0.5);
+
+        // Evaluate the parent area
+        float areaParent = 0.5 * abs(p0P.x * (p2P.y - p3P.y) + p3P.x * (p0P.y - p2P.y) + p2P.x * (p3P.y - p0P.y));
+        areaParent *= _ScreenSize.x * _ScreenSize.y;
+        areaParent *= areaOverestimation;
+
+        // If the depth is too high (max depth changed) or the area is too 
+        return ((_TriangleSize >= areaParent ) || (depth > _MaxSubdivisionDepth)) ? TOO_SMALL : UNCHANGED_ELEMENT;
+    }
+    return UNCHANGED_ELEMENT;
+}
+
+// Needs to be included after BisectorGeometry and TriangleValidity()
+#include "shader_lib/update_utilities.hlsl"
+
+[numthreads(1, 1, 1)]
+void Reset()
+{
+    ResetBuffers();
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Classify(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _IndirectDrawBuffer[9])
+        return;
+
+    // Operate the indirection
+    currentID = _IndexedBisectorBuffer[currentID];
+
+    // Read the current geometry data
+    BisectorGeometry bis;
+    bis.p[0] = _CurrentVertexBuffer[3 * currentID];
+    bis.p[1] = _CurrentVertexBuffer[3 * currentID + 1];
+    bis.p[2] = _CurrentVertexBuffer[3 * currentID + 2];
+    bis.p[3] = _CurrentVertexBuffer[3 * _TotalNumElements + currentID];
+
+    // Classify the element
+    ClassifyElement(currentID, bis, _TotalNumElements, _BaseDepth);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Split(uint dispatchID : SV_DispatchThreadID)
+{
+    if (dispatchID >= _ClassificationBuffer[SPLIT_COUNTER])
+        return;
+
+    // Grab the real elementID
+    uint currentID = _ClassificationBuffer[CLASSIFY_COUNTER_OFFSET + dispatchID];
+
+    // Split the element
+    SplitElement(currentID, _BaseDepth);
+}
+
+[numthreads(1, 1, 1)]
+void PrepareIndirect(uint currentID : SV_DispatchThreadID)
+{
+    _IndirectDispatchBuffer[currentID * 3 + 0] = (_AllocateBuffer[currentID] + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    _IndirectDispatchBuffer[currentID * 3 + 1] = 1;
+    _IndirectDispatchBuffer[currentID * 3 + 2] = 1;
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Allocate(uint groupIndex : SV_GroupIndex, uint dispatchID : SV_DispatchThreadID)
+{
+    // Load the CBT to the LDS
+    load_buffer_to_shared_memory(groupIndex);
+
+    // If this element doesn't need to be processed, we're done
+    if (dispatchID >= _AllocateBuffer[0])
+        return;
+
+    // Allocate the required bits
+    AllocateElement(_AllocateBuffer[1 + dispatchID]);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Bisect(uint groupIndex : SV_GroupIndex, uint dispatchID : SV_DispatchThreadID)
+{
+    // If this element doesn't need to be processed, we're done
+    if (dispatchID >= _AllocateBuffer[0])
+        return;
+
+    // Operation the bisection of this element
+    BisectElement(_AllocateBuffer[1 + dispatchID]);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void PropagateBisect(uint dispatchID : SV_DispatchThreadID)
+{
+    // If this element doesn't need to be processed, we're done
+    if (dispatchID >= _PropagateBuffer[0])
+        return;
+
+    PropagateBisectElement(_PropagateBuffer[2 + dispatchID]);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void PrepareSimplify(uint dispatchID : SV_DispatchThreadID)
+{
+    // If this element doesn't need to be processed, we're done
+    if (dispatchID >= _ClassificationBuffer[SIMPLIFY_COUNTER])
+        return;
+
+    // Grab the real elementID
+    uint currentID = _ClassificationBuffer[CLASSIFY_COUNTER_OFFSET + _TotalNumElements + dispatchID];
+
+    // Simplify an element
+    PrepareSimplifyElement(currentID);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Simplify(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _SimplificationBuffer[0])
+        return;
+
+    // Simplify an element
+    SimplifyElement(_SimplificationBuffer[1 + currentID]);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void PropagateSimplify(uint dispatchID : SV_DispatchThreadID)
+{
+    // If this element doesn't need to be processed, we're done
+    if (dispatchID >= _PropagateBuffer[1])
+        return;
+    
+    PropagateElementSimplify(_PropagateBuffer[2 + dispatchID]);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void ReducePrePass(uint dispatchThreadID : SV_DispatchThreadID)
+{
+    reduce_prepass(dispatchThreadID);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void ReduceFirstPass(uint dispatchThreadID : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+{
+    // Reduce Mid Pass
+    reduce_first_pass(dispatchThreadID, groupIndex);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void ReduceSecondPass(uint groupIndex : SV_GroupIndex)
+{
+    // Find the ith bit set to one
+    reduce_second_pass(groupIndex);
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void BisectorIndexation(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _TotalNumElements)
+        return;
+
+    // Indexate this bisector
+    BisectorElementIndexation(currentID);
+}
+
+[numthreads(1, 1, 1)]
+void PrepareBisectorIndirect(uint currentID : SV_DispatchThreadID)
+{
+    // Indirect dispatch for each bisector
+    _IndirectDispatchBuffer[0] = (_IndirectDrawBuffer[0] / 3 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    _IndirectDispatchBuffer[1] = 1;
+    _IndirectDispatchBuffer[2] = 1;
+    
+    // Indirect dispatch for each vertex to process (3 per bisector + 1 for the parent)
+    _IndirectDispatchBuffer[3] = (_IndirectDrawBuffer[0] * 4 / 3 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    _IndirectDispatchBuffer[4] = 1;
+    _IndirectDispatchBuffer[5] = 1;
+
+    // Indirect dispatch for each modified vertex to process
+    _IndirectDispatchBuffer[6] = (_IndirectDrawBuffer[8] + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    _IndirectDispatchBuffer[7] = 1;
+    _IndirectDispatchBuffer[8] = 1;
+
+    // Explicit counter of the number of bisectors
+    _IndirectDrawBuffer[9] = _IndirectDrawBuffer[0] / 3;
+}
+
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void Validate(uint currentID : SV_DispatchThreadID)
+{
+    // This thread doesn't have any work to do, we're done
+    if (currentID >= _TotalNumElements)
+        return;
+
+    ValidateBisector(currentID);
+}

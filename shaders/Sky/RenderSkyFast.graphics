@@ -1,0 +1,92 @@
+// Initial includes
+#include "shader_lib/common.hlsl"
+
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(1)
+#define RENDER_SKY_CBV_COUNT 2
+
+// SRVs
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT SRV_SLOT(0)
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT SRV_SLOT(1)
+#define SKY_VIEW_LUT_TEXTURE_SLOT SRV_SLOT(2)
+#define DEPTH_BUFFER_TEXTURE_SLOT SRV_SLOT(3)
+#define RENDER_SKY_SRV_COUNT 4
+
+// Samplers
+#define LINEAR_CLAMP_SAMPLER_SLOT SPL_SLOT(0)
+#define RENDER_SKY_SPL_COUNT 4
+
+// Other includes
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/sky_utilities.hlsl"
+
+// SRVs
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_SLOT);
+Texture2D<float4> _SkyViewLUTTexture: register(SKY_VIEW_LUT_TEXTURE_SLOT);
+Texture2D<float> _DepthTexture: register(DEPTH_BUFFER_TEXTURE_SLOT);
+
+// Samplers
+SamplerState sampler_linear_clamp : register(LINEAR_CLAMP_SAMPLER_SLOT);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    VertexOutput output;
+    float2 uv = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+    output.positionCS = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return output;
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+struct PixelOutput
+{
+    float4 attachment0 : SV_Target0;
+};
+
+PixelOutput frag(PixelInput input)
+{
+    // Build the world space position from it
+    float3 depthBufferPosition = evaluate_world_space_position(input.positionCS.xy * _ScreenSize.zw, 0.5, _InvViewProjectionMatrix);
+
+    // Compute the world direction and world position
+    float distanceToCamera = length(depthBufferPosition);
+    float3 WorldDir = depthBufferPosition / max(distanceToCamera, 0.000001);
+    float3 WorldPos = float3(_CameraPosition / 1000.0);
+
+    float3 UpVector = normalize(WorldPos);
+    float viewZenithCosAngle = dot(WorldDir, UpVector);
+    float viewHeight = length(WorldPos);
+
+    float3 sideVector = normalize(cross(UpVector, WorldDir));       // assumes non parallel vectors
+    float3 forwardVector = normalize(cross(sideVector, UpVector));  // aligns toward the sun light but perpendicular to up vector
+    float2 lightOnPlane = float2(dot(_SunDirection, forwardVector), dot(_SunDirection, sideVector));
+    lightOnPlane = normalize(lightOnPlane);
+    float lightViewCosAngle = lightOnPlane.x;
+
+    // Sky view param to uv
+    float2 uv;
+    SkyViewLutParamsToUv(false, viewZenithCosAngle, lightViewCosAngle, viewHeight, uv);
+
+    // Evamite the lighting
+    PixelOutput output;
+    output.attachment0.xyz = _SkyViewLUTTexture.SampleLevel(sampler_linear_clamp, uv, 0).rgb;
+    output.attachment0.xyz += GetSunLuminance((float3)WorldPos, WorldDir, _BottomRadius);
+    output.attachment0.w = _SkyViewLUTTexture.SampleLevel(sampler_linear_clamp, uv, 0).w;
+    return output;
+}

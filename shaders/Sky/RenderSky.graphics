@@ -1,0 +1,101 @@
+// CBVs
+#define GLOBAL_CB_BINDING_SLOT CBV_SLOT(0)
+#define SKY_ATMOSPHERE_BUFFER_SLOT CBV_SLOT(1)
+#define RENDER_SKY_CBV_COUNT 2
+
+// SRVs
+#define TRANSMITTANCE_LUT_TEXTURE_SLOT SRV_SLOT(0)
+#define MULTI_SCATTERING_LUT_TEXTURE_SLOT SRV_SLOT(1)
+#define SKY_VIEW_LUT_TEXTURE_SLOT SRV_SLOT(2)
+#define DEPTH_BUFFER_TEXTURE_SLOT SRV_SLOT(3)
+#define RENDER_SKY_SRV_COUNT 4
+
+// Samplers
+#define LINEAR_CLAMP_SAMPLER_SLOT SPL_SLOT(0)
+#define RENDER_SKY_SPL_COUNT 4
+
+// Includes
+#include "shader_lib/common.hlsl"
+#include "shader_lib/constant_buffers.hlsl"
+#include "shader_lib/sky_utilities.hlsl"
+
+// SRVs
+Texture2D<float4> _TransmittanceLUTTexture: register(TRANSMITTANCE_LUT_TEXTURE_SLOT);
+Texture2D<float4> _MultiScatteringLUTTexture: register(MULTI_SCATTERING_LUT_TEXTURE_SLOT);
+Texture2D<float4> _SkyViewLUTTexture: register(SKY_VIEW_LUT_TEXTURE_SLOT);
+Texture2D<float> _DepthTexture: register(DEPTH_BUFFER_TEXTURE_SLOT);
+
+// Samplers
+SamplerState sampler_linear_clamp : register(LINEAR_CLAMP_SAMPLER_SLOT);
+
+struct VertexInput
+{
+    uint instanceID : SV_InstanceID;
+    uint vertexID : SV_VertexID;
+};
+
+struct VertexOutput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+VertexOutput vert(VertexInput input)
+{
+    VertexOutput output;
+    float2 uv = float2((input.vertexID << 1) & 2, input.vertexID & 2);
+    output.positionCS = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    return output;
+}
+
+struct PixelInput
+{
+    float4 positionCS : SV_POSITION;
+};
+
+struct PixelOutput
+{
+    float4 attachment0 : SV_Target0;
+};
+
+PixelOutput frag(PixelInput input)
+{
+    // Read the depth of the matching fragment
+    float depthValue = _DepthTexture.Load(int3(input.positionCS.xy, 0)).x;
+
+    // Is this a fragment pixel?
+    bool isBackground = (depthValue == 1.0);
+
+    // Build the world space position from it
+    depthValue = isBackground ? 0.5 : depthValue;
+    float3 depthBufferPosition = evaluate_world_space_position(input.positionCS.xy * _ScreenSize.zw, depthValue, _InvViewProjectionMatrix);
+    float distanceToCamera = length(depthBufferPosition);
+    REAL3_DP WorldDir = depthBufferPosition / max(distanceToCamera, 0.000001);
+    REAL3_DP WorldPos = _CameraPosition / 1000.0;
+
+    // Convert distance to kilometers
+    distanceToCamera /= 1000;
+
+    // Compute the world direction and world position if the planet was not actually rendered
+    if (length(float3(_CameraPosition)) >= _PlanetRadiusSky * 1.1)
+        distanceToCamera = ray_sphere_intersect_nearest((float3)WorldPos, (float3)WorldDir, _PlanetCenterSky, _PlanetRadiusSky / 1000.0);
+
+    // Move to top atmosphere as the starting point for ray marching.
+    // This is critical to be after the above to not disrupt above atmosphere tests and voxel selection.
+    if (!MoveToTopAtmosphere(WorldPos, WorldDir))
+    {
+        PixelOutput output;
+        output.attachment0 = float4(GetSunLuminance((float3)WorldPos, (float3)WorldDir, _BottomRadius), 1.0);
+        return output;
+    }
+
+    // Integrate the atmosphere's luminance
+    float3 inScattering, throughput;
+    IntegrateLuminanceThroughput((float3)WorldPos, (float3)WorldDir, _SunDirection, distanceToCamera, 20
+        , _TransmittanceLUTTexture, _MultiScatteringLUTTexture, sampler_linear_clamp
+        , inScattering, throughput);
+
+    // Evaluate the lighting
+    PixelOutput output;
+    output.attachment0 = float4(inScattering, luminance(throughput));
+    return output;
+}
