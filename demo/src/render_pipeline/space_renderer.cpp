@@ -307,6 +307,10 @@ void SpaceRenderer::release()
     m_MeshUpdater.release();
     m_LebMatrixCache.release();
 
+    // Release the RT shader
+    if (m_RayTracingSupported)
+        d3d12::compute_shader::destroy_compute_shader(m_VisibilityRT);
+
     // Imgui cleanup
     imgui_d3d12::release_imgui();
 

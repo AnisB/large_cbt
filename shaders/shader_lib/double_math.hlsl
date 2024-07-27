@@ -100,6 +100,7 @@ double acos_double(double x)
     double z = (-0.168577 * y + 1.56723) * sqrtY;
     return x > 0.0 ? z : 0.5 * PI;
 }
+
 double asin_double(double x)
 {
   double negate = double(x < 0);
@@ -131,28 +132,6 @@ static const double atan_tbl[] = {
 // https://outerra.blogspot.com/2014/05/double-precision-approximations-for-map.html
 double atan2_double(double y, double x)
 {
-#if 0
-    //http://pubs.opengroup.org/onlinepubs/009695399/functions/atan2.html
-    double ONEQTR_PI = PI / 4.0;
-    double THRQTR_PI = 3.0 * PI / 4.0;
-    double r, angle;
-    double abs_y = abs(y) + 1e-10f;      // kludge to prevent 0/0 condition
-    if ( x < 0.0f )
-    {
-        r = (x + abs_y) / (abs_y - x);
-        angle = THRQTR_PI;
-    }
-    else
-    {
-        r = (x - abs_y) / (x + abs_y);
-        angle = ONEQTR_PI;
-    }
-    angle += (0.1963f * r * r - 0.9817f) * r;
-    if ( y < 0.0f )
-        return( -angle );     // negate if in quad III or IV
-    else
-        return( angle );
-#else
     double ax = abs(x);
     double ay = abs(y);
     double t0 = max(ax, ay);
@@ -176,7 +155,6 @@ double atan2_double(double y, double x)
     r = x < 0 ?  PI - r : r;
     r = y < 0 ? -r : r;
     return r;
-#endif
 }
 
 // https://outerra.blogspot.com/2017/06/fp64-approximations-for-sincos-for.html
@@ -211,13 +189,7 @@ double cos_double(double x)
 
 double2 sincos_double(double t)
 {
-#if 0
-    double2 f = abs(frac_double2(t-double2(0.25,0.0))-0.5);
-    double h = abs(frac_double(t*4.0)-0.5);
-    return (-1.0 + f*f*(24.0-32.0*f)) * (1.028519 - 0.0570379*h); 
-#else
 	return double2(sin_double(t), cos_double(t));
-#endif
 }
 
 #endif // DOUBLE_MATH_HLSL
