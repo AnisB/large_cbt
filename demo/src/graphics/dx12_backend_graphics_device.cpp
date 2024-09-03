@@ -10,6 +10,10 @@
 #include <initguid.h>
 #include "dxgidebug.h"
 
+// Export if we are running in experimental
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 614; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = u8".\\D3D12\\"; }
+
 // Tracking if the debug layer was enabled
 static bool g_debugLayerEnabled = false;
 

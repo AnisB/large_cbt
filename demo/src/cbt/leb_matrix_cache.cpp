@@ -65,6 +65,9 @@ void LebMatrixCache::intialize(GraphicsDevice device, CommandQueue cmdQ, Command
 
     // Flush the queue
     d3d12::command_queue::flush(cmdQ);
+
+    // Cleaup the upload buffer
+    d3d12::graphics_resources::destroy_graphics_buffer(lebMatricesBufferUp);
 }
 
 void LebMatrixCache::release()

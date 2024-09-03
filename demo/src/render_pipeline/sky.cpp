@@ -145,6 +145,7 @@ void Sky::release()
 {
 	d3d12::graphics_resources::destroy_constant_buffer(m_SkyAtmosphereCB);
 
+	d3d12::graphics_pipeline::destroy_graphics_pipeline(m_SkyRendererFastGP);
 	d3d12::graphics_pipeline::destroy_graphics_pipeline(m_SkyRendererGP);
 
 	d3d12::compute_shader::destroy_compute_shader(m_SkyViewLutCS);
@@ -170,7 +171,6 @@ void Sky::reload_shaders(const std::string& shaderLibrary)
 	// Transmittance Lut kernel
 	csd.kernelname = transmittance_lut_kernel;
 	compile_and_replace_compute_shader(m_Device, csd, m_TransmittanceLutCS);
-	m_TransmittanceLutCS = d3d12::compute_shader::create_compute_shader(m_Device, csd);
 
 	// Multi Scat Lut kernel
 	csd.kernelname = multi_scattering_lut_kernel;

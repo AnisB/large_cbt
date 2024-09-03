@@ -173,3 +173,7 @@ endmacro()
 macro(copy_next_to_binary target_project target_asset)
     add_custom_command(TARGET ${target_project} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${target_asset}" $<TARGET_FILE_DIR:${target_project}>)
 endmacro()
+
+macro(copy_dir_next_to_binary target_project target_dir dir_name)
+    add_custom_command(TARGET ${target_project} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${target_dir}" "$<TARGET_FILE_DIR:${target_project}>/${dir_name}")
+endmacro()

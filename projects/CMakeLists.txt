@@ -30,5 +30,8 @@ copy_next_to_binary(outer_space "${PROJECT_3RD_BINARY}/msvcp140.dll")
 copy_next_to_binary(outer_space "${PROJECT_3RD_BINARY}/vcruntime140.dll")
 copy_next_to_binary(outer_space "${PROJECT_3RD_BINARY}/vcruntime140_1.dll")
 
+# Agility SDK
+copy_dir_next_to_binary(outer_space "${PROJECT_SOURCE_DIR}/3rd/bin/D3D12" "D3D12")
+
 # Set the argmuent
 set_target_properties(outer_space PROPERTIES VS_DEBUGGER_COMMAND_ARGUMENTS "${PROJECT_SOURCE_DIR}")
