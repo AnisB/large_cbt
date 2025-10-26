@@ -53,6 +53,11 @@ float phillips_spectrum(float2 k, float2 w, float V, float directionDampener, fl
     return PHILLIPS_AMPLITUDE_SCALAR * result / (patchSize * patchSize);
 }
 
+float2 complex_conjugate(float2 a)
+{
+    return float2(a.x, -a.y);
+}
+
 float2 complex_exp(float arg)
 {
     return float2(cos(arg), sin(arg));

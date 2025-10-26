@@ -70,9 +70,10 @@ void Dispersion(uint3 currentThread : SV_DispatchThreadID)
     float  w = sqrt(EARTH_GRAVITY * kl);
     float2 kx = float2(k.x / kl, 0.0);
     float2 ky = float2(k.y / kl, 0.0);
-
     float2 h0 = _SpectrumBuffer.Load(int4(currentThread.xy, currentThread.z, 0));
-    float2 ht = complex_mult(h0, complex_exp(w * _SimulationTime));
+    float2 ch0 = complex_conjugate(h0);
+    float2 ht = complex_mult(h0, complex_exp(w * _SimulationTime)) 
+                    + complex_mult(ch0, complex_exp(-w * _SimulationTime));
     float2 dx = complex_mult(complex_mult(float2(0, -1), kx), ht);
     float2 dy = complex_mult(complex_mult(float2(0, -1), ky), ht);
 

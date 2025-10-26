@@ -20,7 +20,6 @@ public:
     // Shader reload
     void reload_shaders(const std::string& shaderLibrary);
 
-
     // Build mips for a texture
     void build_mips(CommandBuffer cmd, Texture targetTexture);
 
